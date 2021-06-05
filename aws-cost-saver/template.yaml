@@ -1,0 +1,215 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AWS Serverless Cost Saver
+
+Globals:
+  Function:
+    Timeout: 5
+
+Parameters:
+  VpcId:
+    Type: String
+    Description: VPC
+  ALBListenerArn:
+    Type: String
+    Description: ARN of the ALB Listener Rule
+  ECSServiceDesiredCount:
+    Type: Number
+    Description: ECS Desired task count
+  ECSServiceSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: ECS Service subnets
+
+Resources:
+  EcsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: 256
+      Memory: 512
+      RequiresCompatibilities: [ "EC2", "FARGATE" ]
+      NetworkMode: awsvpc
+      ContainerDefinitions:
+        - Name: MyAppContainer
+          Essential: "true"
+          Image: nginxdemos/hello
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 80
+              Protocol: tcp
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListenerRule
+    Properties:
+      DesiredCount: !Ref ECSServiceDesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref SecurityGroup
+          Subnets: !Ref ECSServiceSubnets
+      LoadBalancers:
+        - ContainerName: MyAppContainer
+          ContainerPort: 80
+          TargetGroupArn: !Ref MainAppTargetGroup
+      TaskDefinition: !Ref EcsTaskDefinition
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group allowing access to the HTTP port
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          Description: Permit HTTP
+          FromPort: 80
+          IpProtocol: tcp
+          ToPort: 80
+
+  MainAppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 15
+      HealthCheckPath: /
+      HealthCheckPort: traffic-port
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: 200
+      Port: 80
+      TargetType: ip
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 5
+      VpcId: !Ref VpcId
+
+  ALBListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref MainAppTargetGroup
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /my-app*
+      ListenerArn: !Ref ALBListenerArn
+      Priority: 100
+
+  StandByTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: StandByTargetGroupPermission
+    Properties:
+      TargetType: lambda
+      Targets:
+        - Id : !GetAtt ScaleOutFunction.Arn
+
+  StandByTargetGroupPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref ScaleOutFunction
+      Principal: 'elasticloadbalancing.amazonaws.com'
+
+  ScaleOutFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: scaling_functions/
+      Handler: scale.scale_out
+      Runtime: python3.8
+      Role: !GetAtt ScalingFunctionRole.Arn
+      Environment:
+        Variables:
+          ECS_SERVICE_NAME: !Ref ECSService
+          ECS_SERVICE_DESIRED_COUNT: !Ref ECSServiceDesiredCount
+          ALB_LISTENER_RULE_ARN: !Ref ALBListenerRule
+          MAIN_APP_TARGET_GROUP: !Ref MainAppTargetGroup
+
+  ScaleInFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: scaling_functions/
+      Handler: scale.scale_in
+      Runtime: python3.8
+      Role: !GetAtt ScalingFunctionRole.Arn
+      Environment:
+        Variables:
+          ECS_SERVICE_NAME: !Ref ECSService
+          ECS_SERVICE_DESIRED_COUNT: !Ref ECSServiceDesiredCount
+          ALB_LISTENER_RULE_ARN: !Ref ALBListenerRule
+          STANDBY_TARGET_GROUP_ARN: !Ref StandByTargetGroup
+
+  ScalingFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+      Policies:
+        - PolicyName: ScalingFunctionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecs:UpdateService
+                Resource: !Ref ECSService
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DescribeRules
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:ModifyRule
+                Resource: !Ref ALBListenerRule
+
+  NoTrafficAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      ActionsEnabled: True
+      AlarmActions:
+        - !Ref SNSTopic
+      AlarmDescription: Trigger when load drops below threshold
+      ComparisonOperator: LessThanThreshold
+      DatapointsToAlarm: 1
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt MainAppTargetGroup.TargetGroupFullName
+      EvaluationPeriods: 1
+      MetricName: RequestCountPerTarget
+      Namespace: AWS/ApplicationELB
+      Period: 120
+      Statistic: Sum
+      Threshold: 1
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Alarm Notifications
+      Subscription:
+        - Endpoint: !GetAtt ScaleInFunction.Arn
+          Protocol: lambda
+
+  SNSPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref ScaleInFunction
+      Principal: 'sns.amazonaws.com'
